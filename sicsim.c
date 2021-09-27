@@ -417,6 +417,125 @@ int main(void) {
 
 			}
 		}
+		else if (!strcmp(order, "progaddr"))
+		{
+			if (last_part[strlen(last_part) - 1] == ',')//인자의 끝이 comma로 끝나면 잘못된 argument
+			{
+				printf("Wrong argument!\n");
+				continue;
+			}
+			if (!strcmp(last_part, ""))//아무런 인자도 들어오지 않은 경우 잘못된 argument
+			{
+				printf("Wrong argument!\n");
+				continue;
+			}
+			else {//인자가 있는 경우
+				int count = 0;
+				char* ptr = strtok(last_part, ",");//,를 기준으로 parsing
+				while (ptr != NULL)
+				{
+					strcpy(argument[count], ptr);
+					ptr = strtok(NULL, ",");
+					count++;
+					if (count > 3)
+						break;
+				}
+
+				if (count != 1)//인자가 1개가 아닌 경우 잘못된 argument
+				{
+					printf("Wrong argument!\n");
+					continue;
+				}
+				else//인자가 1개인 경우 progaddr
+				{
+					set_progaddr(argument[0]);
+				}
+
+			}
+		}
+		else if (!strcmp(order, "loader"))
+		{
+			if (last_part[strlen(last_part) - 1] == ',')//인자의 끝이 comma로 끝나면 잘못된 command
+			{
+				printf("Wrong argument!\n");
+				continue;
+			}
+			if (!strcmp(last_part, ""))//아무런 인자도 들어오지 않은 경우 잘못된 argument
+			{
+				printf("Wrong argument!\n");
+				continue;
+			}
+			else {//인자가 있는 경우
+				int file_count = sscanf(last_part, "%s %s %s %s", load_file_name[0], load_file_name[1], load_file_name[2], load_file_name[3]);
+				if (file_count <= 0 || file_count > 3)
+				{
+					printf("you can get 1~3 file name argument");
+					continue;
+				}
+				else
+				{
+					loader(file_count);
+					load_file_name[0][0] = '\0';
+					load_file_name[1][0] = '\0';
+					load_file_name[2][0] = '\0';
+					load_file_name[3][0] = '\0';
+				}
+			}
+		}
+		else if (!strcmp(order, "bp"))
+		{
+			if (last_part[strlen(last_part) - 1] == ',')//인자의 끝이 comma로 끝나면 잘못된 argument
+			{
+				printf("Wrong argument!\n");
+				continue;
+			}
+			if (!strcmp(last_part, ""))//아무런 인자도 들어오지않는 경우
+			{
+				print_bp();
+				continue;
+			}
+			else {//인자가 있는 경우
+				int count = 0;
+				char* ptr = strtok(last_part, ",");//,를 기준으로 parsing
+				while (ptr != NULL)
+				{
+					strcpy(argument[count], ptr);
+					ptr = strtok(NULL, ",");
+					count++;
+					if (count > 3)
+						break;
+				}
+
+				if (count != 1)//인자가 1개가 아닌 경우 잘못된 argument
+				{
+					printf("Wrong argument!\n");
+					continue;
+				}
+				else//인자가 1개인 경우 bp clear 또는 bp address
+				{
+					if (!strcmp(argument[0], "clear"))
+					{
+						bp_clear();
+					}
+					else
+					{
+						set_bp(argument[0]);
+					}
+				}
+
+			}
+		}
+		else if (!strcmp(order, "run"))
+		{
+			if (!strcmp(last_part, ""))//last_part가 비어있으면 올바른 command
+			{
+				run();
+			}
+			else//last_part가 비어있지 않으면 올바르지 않은 command
+			{
+				printf("Wrong argument!\n");
+			}
+		}
 		else if (!strcmp(order, "symbol"))
 		{
 			if (!strcmp(last_part, ""))//last_part가 비어있으면 올바른 command
@@ -428,6 +547,8 @@ int main(void) {
 				printf("Wrong argument!\n");
 			}
 		}
+
+
 		else//그외 모든 커맨드들은 잘못된 커맨드
 		{
 			printf("Wrong Command!\n");

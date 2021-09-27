@@ -53,10 +53,22 @@ typedef struct modi_code {
 modi_link modi_head = NULL;//object Code의 relocation을 위한 modify 에 대한 정보 저장하는 list
 modi_link modi_tail = NULL;
 
+typedef struct estab* estab_link;
+typedef struct estab {
+	char csect_name[7];
+	char symbol_name[7];
+	int addr;
+	int cs_length;
+	estab_link link;
+}Estab;
+estab_link estab_head = NULL;//estab에 대한 정보를 저장하는 list.
+estab_link estab_tail = NULL;
+
+
 char command[200];//전체 shell command 저장
 char order[200];//전체 shell command중 명령어 부분만 저장
 char last_part[200];//전체 shell command중 명령어 제외한 부분 저장.
-char argument[4][50];//전체 shell command중 start 부분 저장, argument[3]에는 쓰레기값
+char argument[5][50];//전체 shell command중 start 부분 저장, argument[3]에는 쓰레기값
 char mnemonic[10];
 int start, end;//dump의 인자 start, end값 저장
 int address, value;//edit의 인자 address와 value 저장
@@ -64,9 +76,17 @@ int base_address = 0;//마지막 address + 1번지를 담고 있는 주소 즉 �
 char filename[50];//filename을 저장
 unsigned char memory_space[1048576];//가상의 메모리 공간
 char program_name[50];//program 이름 저장.
-int start_address, program_length;//프로그램 시작주소, 길이
-
-
+int start_address, program_length;//프로그램 시작주소, 길이(assembly시 씀))
+int prog_addr = 0;//program이 memory의 어디에 올라갈지 시작 address 지칭(loader 시))
+int prog_length = 0;//로딩한 전체 프로그램의 program length를 지칭(loader 시)
+int cs_addr = 0;//control section이 memory의 어디에 올라갈지 시작 address를 지칭.(loader 시)
+int cs_length = 0;//control section의 길이.(loader 시)
+int exec_addr = 0;//exec하는데 쓰이는 address;(loader 시)
+char load_file_name[5][50];//전체 shell command중 start 부분 저장, argument[3]에는 쓰레기값(loader시)
+int bp_table[1048576] = { 0 };//bp인지를 확인하는 테이블(loader 시)
+int reg[10];//REGISTER값들 저장하는 것.
+char CC;
+int bp_zero_flag=0;//bp가 0에 set 되어있을 때를 처리해주기 위한 flag, 1인 경우 bp가 0에서 한번 멈춰준 것임.
 void get_normalize_command();
 void get_order_of_command();
 void get_normalize_last_part();
@@ -87,7 +107,8 @@ void free_list();
 void print_error(int line_num, char* description);
 void parse_instruction(char* instruction, char* label, char* opcode, char* operand);
 int find_format(char* mnemonic);
-int find_opcode(char *mnemonic);
+
+int find_opcode(char* mnemonic);
 int add_symbol_to_symbol_list(char* label, int line_num, int location_counter);
 void print_record(FILE* obj_fp);
 int get_register_value(char* reg);
@@ -113,7 +134,1025 @@ void type();
 void assemble();
 void symbol();
 
+void set_progaddr(char* address);
+void loader(int count);
+int loader_pass1(char* file_name);
+int loader_pass2(char* file_name);
+int estab_add(Estab* node);
+int existed_in_estab(Estab* node);
+void print_loadmap();
+void print_bp();
+void bp_clear();
+void set_bp(char* address);
+void run();
+int get_value(int n, int i, int x, int b, int p, int e, int address_part);
 
+
+
+//A=reg[0], X=reg[1], L=reg[2] , B=reg[3], S=reg[4], T=reg[5], F, reg[8], reg[9]
+
+
+/////////////////////////////////////////////
+//함수명: get_target_address                 //
+//기능: n,i x,b,p,e, address field를 이용해   //
+//     실제 target address 계산              //
+//리턴: target_address 주소                  //
+/////////////////////////////////////////////
+int get_target_address()
+{
+	int  n, i, x, b, p, e;
+	n = (memory_space[reg[8]] & 0x02)>>1;
+	i = memory_space[reg[8]] & 0x01;
+	x = (memory_space[reg[8] + 1] & 0x80) >> 7;
+	b = (memory_space[reg[8] + 1] & 0x40) >> 6;
+	p = (memory_space[reg[8] + 1] & 0x20) >> 5;
+	e = (memory_space[reg[8] + 1] & 0x10) >> 4;
+	int through_address;//임시 address로, indirect의 경우 중간에 거쳐가는 address
+	int target_address;
+	int format = 0;
+	if (n == 0 && i == 0)//sic 뒤의 15비트가 address
+	{
+		format = 3;
+
+		target_address = ((int)memory_space[reg[8] + 1] & 0x7f) *256 + memory_space[reg[8] + 2];
+
+		if (x == 1)//indexed addressing
+		{
+			target_address += reg[1]; // X register 값 넣어줌.
+		}
+
+	}
+	else if (e == 0)//3형식인 경우 12비트가 address field
+	{
+		format = 3;
+
+		through_address = ((int)memory_space[reg[8] + 1] & 0x0f) *256 + memory_space[reg[8] + 2];//임시 어드레스
+
+		if ((through_address & 0x800) != 0)//address가 음수이면 보정 필요  
+			//(앞 쪽이 전부다 f로 확장되어있는 것이 아니므로 바로 연산할 수 없음)
+		{
+			through_address = ~(through_address - 1);//2's complement값 구함(양수로 바꿈)
+			through_address = -(through_address & 0x7ff);//양수로 바꾸었으므로 다시 음수로 바꾸어줌
+
+		}
+
+		if (x == 1)//indexed addressing
+			through_address += reg[1];
+
+		if (p == 1)//pc relative
+			through_address += reg[8] + format;//pc는 다음 명령어를 가르켜야하므로
+
+		if (b == 1)//base relative
+			through_address += reg[3];
+
+		if (n == 1 && i == 0)//indirect addressing인 경우
+		{
+			target_address = ((int)memory_space[through_address]) *256*256
+				+ ((int)memory_space[through_address + 1]) *256
+				+ (int)memory_space[through_address + 2];//진짜 target address
+
+		}
+		else if (n == 0 && i == 1)//immediate addressing의 경우
+		{
+			target_address = through_address;
+		}
+		else//simple addressing인 경우
+		{
+			target_address = through_address;
+		}
+
+	}
+	else//4형식인 경우
+	{
+		format = 4;
+		through_address = ((int)memory_space[reg[8] + 1] & 0x0f) *256//임시 address
+			+ ((int)memory_space[reg[8] + 2]) *256
+			+ (int)memory_space[reg[8] + 3];
+
+		if (x == 1)//indexed addressing
+			through_address += reg[1];
+
+		if (n == 1 && i == 0)//indirect addressing인 경우
+		{
+			target_address = ((int)memory_space[through_address]) *256*256
+				+ ((int)memory_space[through_address + 1]) *256
+				+ (int)memory_space[through_address + 2];//진짜 target address
+		}
+		else if (n == 0 && i == 1)//immediate addressing의 경우
+		{
+			target_address = through_address;
+		}
+		else//simple addressing인 경우
+		{
+			target_address = through_address;
+		}
+	}
+
+	return target_address;
+}
+
+/////////////////////////////////////////////
+//함수명: get_value_format_34               //
+//기능: n,i x,b,p,e, address field를 이용해   //
+//     명령에 이용되는 최종 value값  계산         //
+//리턴: 최종 value값                          //
+/////////////////////////////////////////////
+int get_value_format_34()
+{
+	int  n, i, x, b, p, e;
+	n = (memory_space[reg[8]] & 0x02) >> 1;
+	i = memory_space[reg[8]] & 0x01;
+	x = (memory_space[reg[8] + 1] & 0x80) >> 7;
+	b = (memory_space[reg[8] + 1] & 0x40) >> 6;
+	p = (memory_space[reg[8] + 1] & 0x20) >> 5;
+	e = (memory_space[reg[8] + 1] & 0x10) >> 4;
+	int through_address;//임시 address로, indirect의 경우 중간에 거쳐가는 address
+	int target_address, value;
+	int format = 0;
+	if (n == 0 && i == 0)//sic 뒤의 15비트가 address
+	{
+		format = 3;
+
+		target_address = ((int)memory_space[reg[8] + 1] & 0x7f) *256 + memory_space[reg[8] + 2];
+
+		if (x == 1)//indexed addressing
+		{
+			target_address += reg[1]; // X register 값 넣어줌.
+		}
+
+		value = ((int)memory_space[target_address]) *256*256
+			+ ((int)memory_space[target_address + 1]) *256
+			+ (int)memory_space[target_address + 2];//target address 통해 value 구함
+	}
+	else if (e == 0)//3형식인 경우 12비트가 address field
+	{
+		format = 3;
+
+		through_address = ((int)memory_space[reg[8] + 1] & 0x0f) *256 + memory_space[reg[8] + 2];//임시 어드레스
+
+		if ((through_address & 0x800) != 0)//address가 음수이면 보정 필요  
+			//(앞 쪽이 전부다 f로 확장되어있는 것이 아니므로 바로 연산할 수 없음)
+		{
+			through_address = ~(through_address - 1);//2's complement값 구함(양수로 바꿈)
+			through_address = -(through_address & 0x7ff);//양수로 바꾸었으므로 다시 음수로 바꾸어줌
+
+		}
+
+		if (x == 1)//indexed addressing
+			through_address += reg[1];
+
+		if (p == 1)//pc relative
+			through_address += reg[8] + format;//pc는 다음 명령어를 가르켜야하므로
+
+		if (b == 1)//base relative
+			through_address += reg[3];
+
+		if (n == 1 && i == 0)//indirect addressing인 경우
+		{
+			target_address = ((int)memory_space[through_address]) *256*256
+				+ ((int)memory_space[through_address + 1]) *256
+				+ (int)memory_space[through_address + 2];//진짜 target address
+
+			value = ((int)memory_space[target_address]) *256*256
+				+ ((int)memory_space[target_address + 1])*256
+				+ (int)memory_space[target_address + 2];//target address 통해 value 구함
+		}
+		else if (n == 0 && i == 1)//immediate addressing의 경우
+		{
+			target_address = through_address;
+			value = target_address;//value자체가 target address가 됨.
+		}
+		else//simple addressing인 경우
+		{
+			target_address = through_address;
+			value = ((int)memory_space[target_address]) *256*256
+				+ ((int)memory_space[target_address + 1]) *256
+				+ (int)memory_space[target_address + 2];//target address 통해 value 구함
+		}
+
+	}
+	else//4형식인 경우
+	{
+		format = 4;
+
+		through_address = ((int)memory_space[reg[8] + 1] & 0x0f) *256*256//임시 address
+			+ ((int)memory_space[reg[8] + 2]) *256
+			+ (int)memory_space[reg[8] + 3];
+
+		if (x == 1)//indexed addressing
+			through_address += reg[1];
+
+		if (n == 1 && i == 0)//indirect addressing인 경우
+		{
+			target_address = ((int)memory_space[through_address]) *256*256
+				+ ((int)memory_space[through_address + 1]) *256
+				+ (int)memory_space[through_address + 2];//진짜 target address
+
+			value = ((int)memory_space[target_address]) *256*256
+				+ ((int)memory_space[target_address + 1]) *256
+				+ (int)memory_space[target_address + 2];//target address 통해 value 구함
+		}
+		else if (n == 0 && i == 1)//immediate addressing의 경우
+		{
+			target_address = through_address;
+			value = target_address;//value자체가 target address가 됨.
+		}
+		else//simple addressing인 경우
+		{
+			target_address = through_address;
+			value = ((int)memory_space[target_address]) *256*256
+				+ ((int)memory_space[target_address + 1]) *256
+				+ (int)memory_space[target_address + 2];//target address 통해 value 구함
+		}
+	}
+	reg[8] = reg[8] + format;
+	return value;
+}
+/////////////////////////////////////////////
+//함수명: run                                //
+//기능: 메모리에 load된 프로그램을 수행하고         //
+//     실행 결과로 register 상태를 화면에 출력    //
+//리턴: 없음                                 //
+/////////////////////////////////////////////
+void run()
+{
+	int opcode;//opcode와 필요한 비트값.
+	int r1, r2;//2형식인 경우 레지스터값
+	int value;//target address 안의 value값. 
+	int target_address;
+	int first_flag = 0;
+	//todo: break point 가 0인경우 고려하기
+	while (reg[8] != prog_addr + prog_length)//program 끝에 도달하기 전까지.
+	{
+		if(bp_zero_flag==0 && bp_table[reg[8]-prog_addr]==1 && reg[8]-prog_addr==0)
+		{
+			bp_zero_flag=1;//bp가 0일때 한번 멈추었다는 것을 의미
+			break;
+		}
+		if (first_flag == 0)//처음 시도인 경우 이미 멈춘 break point에 멈추지 않도록 넘어가줌.
+		{
+			first_flag = 1;
+		}
+		else if (bp_table[reg[8]-prog_addr] == 1)//만약 break point이면 break;
+		{
+			break;
+		}
+
+		opcode = memory_space[reg[8]] & 0xfc;
+
+
+		//copy프로그램 만 고려하므로 copy program에서 쓰이는 명령어
+		//LDA, LDB, LDCH, LDT
+		//J,JEQ,JLT,JSUB,
+		//COMP, COMPR, CLEAR
+		//STA, STL, STCH, STX 
+		//BYTE,, TD, RD,  TIXR,  , RSUB
+		//, WD
+
+
+		if (opcode == 0x00)// LDA 3/4
+		{
+			target_address = get_target_address();
+			value= get_value_format_34();
+			reg[0] = value;
+		}
+		else if (opcode == 0x68)// LDB 3/4
+		{
+			target_address = get_target_address();
+			value= get_value_format_34();
+			reg[3] = value;
+		}
+
+		else if (opcode == 0x50)// LDCH 3/4
+		{
+			//get_value_format_34()는 word를 가져오는데 m..m+2의 word이므로
+			//A의 right mostbyte에 m을 넣기위해서는 받은 VALUE값을 16만큼 오른쪽으로 shift 해주어야함.
+			target_address = get_target_address();
+			value= get_value_format_34();
+			reg[0] &= 0xFFFF00;
+			reg[0] |= (value >> 16);
+		}
+
+		else if (opcode == 0x74)// LDT 3/4
+		{
+			target_address = get_target_address();
+			value= get_value_format_34();
+			reg[5] = value;
+		}
+		else if (opcode == 0x04)//LDX 3/4
+		{
+			target_address = get_target_address();
+			value = get_value_format_34();
+			reg[1] = value;
+		}
+		else if (opcode == 0x3C)// J 3/4
+		{
+			target_address = get_target_address();
+			value = get_value_format_34();
+			reg[8] = target_address;
+		}
+
+		else if (opcode == 0x30)// JEQ 3/4
+		{
+			target_address = get_target_address();
+			value = get_value_format_34();
+			if (CC == '=')
+				reg[8] = target_address;
+		}
+
+		else if (opcode == 0x38)// JLT 3/4
+		{
+			target_address = get_target_address();
+			value = get_value_format_34();
+			if (CC == '<')
+				reg[8] = target_address;
+		}
+
+		else if (opcode == 0x48)// JSUB 3/4
+		{
+			target_address = get_target_address();
+			value = get_value_format_34();
+			reg[2] = reg[8];
+			reg[8] = target_address;
+		}
+
+		else if (opcode == 0xB4)//CLEAR 2
+		{
+			r1 = ((int)memory_space[reg[8] + 1] & 0xf0) >> 4;
+
+			reg[r1] = 0;
+
+			reg[8] = reg[8] + 2;
+		}
+
+		else if (opcode == 0x28)//COMP 3/4
+		{
+			target_address = get_target_address();
+			value = get_value_format_34();
+
+			
+			//A register와 m..m+2 value값 비교
+			if (reg[0] < value)
+				CC = '<';
+			else if (reg[0] == value)
+				CC = '=';
+			else
+				CC = '>';
+
+		}
+
+		else if (opcode == 0xA0)//COMPR 2
+		{
+			r1 = ((int)memory_space[reg[8] + 1] & 0xf0) >> 4;
+			r2 = (int)memory_space[reg[8] + 1] & 0x0f;
+			//r1과 r2 비교
+			if (reg[r1] < reg[r2])
+				CC = '<';
+			else if (reg[r1] == reg[r2])
+				CC = '=';
+			else
+				CC = '>';
+			reg[8] = reg[8] + 2;
+		}
+		else if (opcode == 0x0C)//STA 3/4
+		{
+			target_address = get_target_address();
+			value = get_value_format_34();
+			memory_space[target_address] = (reg[0] & 0xff0000) >> 16;
+			memory_space[target_address+1] = (reg[0] & 0xff00) >> 8;
+			memory_space[target_address+2] = (reg[0] & 0xff);
+			
+		}
+		else if (opcode == 0x54)// STCH 3/4
+		{
+			target_address = get_target_address();
+			value = get_value_format_34();
+			memory_space[target_address] = (reg[0] & 0xff);
+		}
+		else if (opcode == 0x14)// STL 3/4
+		{
+			target_address = get_target_address();
+			value = get_value_format_34();
+			memory_space[target_address] = (reg[2] & 0xff0000) >> 16;
+			memory_space[target_address+1] = (reg[2] & 0xff00) >> 8;
+			memory_space[target_address+2] = (reg[2] & 0xff);
+		}
+
+		else if (opcode == 0x10)// STX 3/4
+		{
+			target_address = get_target_address();
+			value = get_value_format_34();
+			memory_space[target_address] = (reg[1] & 0xff0000) >> 16;
+			memory_space[target_address+1] = (reg[1] & 0xff00) >> 8;
+			memory_space[target_address+2] = (reg[1] & 0xff);
+		}
+
+		else if (opcode == 0xB8)//TIXR 2
+		{
+			r1 = ((int)memory_space[reg[8] + 1] & 0xf0) >> 4;
+			reg[1] += 1;
+			if (reg[1] < reg[r1])
+			{
+				CC = '<';
+			}
+			else if (reg[1] == reg[r1])
+			{
+				CC = '=';
+			}
+			else
+			{
+				CC = '>';
+			}
+			reg[8] = reg[8] + 2;
+		}
+		else if (opcode == 0x4C)//RSUB 3/4
+		{
+			reg[8] = reg[2];
+		}
+		else if (opcode == 0xD8)// RD 3/4
+		{
+			target_address = get_target_address();
+			value = get_value_format_34();
+		}
+
+		else if (opcode == 0xE0)//TD 3/4
+		{
+			target_address = get_target_address();
+			value = get_value_format_34();
+			CC = '<';
+		}
+
+		else if (opcode == 0xDC)// WD 3/4
+		{
+			target_address = get_target_address();
+			value = get_value_format_34();
+		}
+	}
+	store_history(0);
+	printf("A : %06X   X : %06X\n", reg[0], reg[1]);
+	printf("L : %06X  PC : %06X\n", reg[2], reg[8]);
+	printf("B : %06X   S : %06X\n", reg[3], reg[4]);
+	printf("T : %06X\n", reg[5]);
+
+	if (reg[8] == prog_addr + prog_length)//프로그램의 끝이면
+	{
+		printf("\t\tEnd Program\n");
+		//다시 처음부터 돌아갈 수 있도록 셋팅.
+		reg[0] = 0; reg[1] = 0; reg[3] = 0; reg[4] = 0; reg[5] = 0; // REGISTER 0으로 초기화
+		reg[8] = prog_addr;//pc에 첫 수행주소 넣어줌.
+		reg[2] = prog_length;//L register에 프로그램 전체 길이 넣어줌.
+	bp_zero_flag=0;
+	}
+	else//break point에서 멈춘 경우
+	{
+		printf("\t\tStop at checkpoint[%X]\n", reg[8]);
+	}
+}
+
+
+/////////////////////////////////////////////
+//함수명: print_bp                           //
+//기능: set_bp에 의해 지정된 break_point들을     //
+//     화면에 출력                            //
+//리턴: 없음                                 //
+/////////////////////////////////////////////
+void print_bp()
+{
+	int i = 0;
+	printf("\t\tbreakpoint\n");
+	printf("\t\t----------\n");
+	for (i = 0; i < 1048576; i++)
+	{
+		if (bp_table[i] == 1)
+			printf("\t\t%X\n", i);
+	}
+	store_history(0);
+}
+/////////////////////////////////////////////
+//함수명: bp_clear                           //
+//기능: set_bp에 의해 지정된 break_point들을     //
+//     모두 삭제                              //
+//리턴: 없음                                 //
+/////////////////////////////////////////////
+void bp_clear()
+{
+	int i;
+	for (i = 0; i < 1048576; i++)
+	{
+		bp_table[i] = 0;
+	}
+	printf("\t\t[ok] clear all breakpoints\n");
+	store_history(1);
+}
+/////////////////////////////////////////////
+//함수명: set_bp                             //
+//기능: sicsim에 breakpoint를 지정하는 역할      //
+//                                         //
+//리턴: 없음                                 //
+/////////////////////////////////////////////
+void set_bp(char* address)
+{
+	int bp_addr = string_to_int(address);
+	if (bp_addr == -1)
+	{
+		printf("Wrong argument!\n");
+		return;
+	}
+	bp_table[bp_addr] = 1;
+	printf("\t\t[ok] create breakpoint %s\n", address);
+	store_history(1);
+}
+/////////////////////////////////////////////
+//함수명: set_progaddr                       //
+//기능: loader또는 run명령어를 수행할 때 시작할    //
+//     주소 prog_addr을 지정하는 역할           //
+//리턴: 없음                                 //
+/////////////////////////////////////////////
+void set_progaddr(char* address) {
+	prog_addr = string_to_int(address);
+	if (prog_addr == -1)
+	{
+		prog_addr = 0;
+		printf("invalid program address");
+	}
+	reg[8]=prog_addr;
+	store_history(1);
+}
+/////////////////////////////////////////////
+//함수명: free_estab                         //
+//기능: loader에 의해 생성된 estab을 free하는 역할 //
+//                                         //
+//리턴: 없음                                 //
+/////////////////////////////////////////////
+void free_estab()
+{
+	//free object code list
+	Estab* estab_ptr = estab_head;
+	estab_head = NULL;
+	estab_tail = NULL;
+	while (estab_ptr != NULL)//estab list 순회하면서 동적할당된 노드들 deallocate
+	{
+		Estab* temp = estab_ptr->link;
+		free(estab_ptr);
+		estab_ptr = temp;
+	}
+}
+/////////////////////////////////////////////
+//함수명: loader                             //
+//기능: object 파일들을 읽어서 linking 작업을 수행후//
+//     가상 메모리에 그 결과를 기록               //
+//리턴: 없음                                 //
+/////////////////////////////////////////////
+void loader(int file_count)
+{
+	int i;
+	int flag = 1;//loader 성공여부 저장.
+
+	free_estab();//기존의 estab 없애줌.
+	cs_addr = prog_addr;
+
+	for (i = 0; i < file_count; i++)
+	{
+		if (loader_pass1(load_file_name[i]) == -1)//pass1 실패시 
+		{
+			flag = 0;
+			break;
+		}
+	}
+
+	if (flag == 1)//모든 것에 대한 pass1 성공 후 pass2 진행
+	{
+		cs_addr = prog_addr;
+		exec_addr = prog_addr;
+		for (i = 0; i < file_count; i++)
+		{
+			if (loader_pass2(load_file_name[i]) == -1)
+			{
+				flag = 0;
+				break;
+			}
+		}
+	}
+
+	if (flag == 1)//pass2까지 성공했을 시에 estab 출력.
+	{
+		print_loadmap();
+		//todo:store history
+	}
+}
+/////////////////////////////////////////////
+//함수명: estab_add                           //
+//기능: estab에 symbol을 추가하는 기능을 한다.     //
+//                                         //
+//리턴: 성공시 1리턴, 실패시(이미 존재 시) -1리턴    //
+/////////////////////////////////////////////
+int estab_add(Estab* node)
+{
+	if (estab_head == NULL)
+	{
+		estab_head = node;
+		estab_tail = node;
+	}
+	else
+	{
+		if (existed_in_estab(node))//같은 심볼이름이 estab에 이미 존재.
+		{
+			return -1;
+		}
+		estab_tail->link = node;
+		estab_tail = node;
+	}
+	return 1;
+}
+/////////////////////////////////////////////
+//함수명: existed_in_estab                   //
+//기능: estab에 symbol이 있는지 확인하는 역할     //
+//                                         //
+//리턴: 있으면 1리턴, 없으면 0 리턴               //
+/////////////////////////////////////////////
+int existed_in_estab(Estab* node)
+{
+	estab_link ptr;
+	for (ptr = estab_head; ptr != NULL; ptr = ptr->link)
+	{
+		//같은 csect이름이나 심볼이름이 서로 겹치면 1 리턴해줌
+		if ((!strcmp(ptr->csect_name, node->symbol_name) && strcmp(ptr->csect_name, "")) ||
+			(!strcmp(ptr->csect_name, node->csect_name) && strcmp(ptr->csect_name, "")) ||
+			(!strcmp(ptr->symbol_name, node->symbol_name) && strcmp(ptr->symbol_name, "")) ||
+			(!strcmp(ptr->symbol_name, node->csect_name) && strcmp(ptr->symbol_name, "")))
+		{
+			return 1;
+		}
+	}
+
+	return 0;
+}
+/////////////////////////////////////////////
+//함수명: print_loadmap                      //
+//기능: estab을 순회하면서 loadmap을 출력하고     //
+//     각 register들을 초기화하는 역할을 한다.    //
+//리턴: 없음                                 //
+/////////////////////////////////////////////
+void print_loadmap()
+{
+	estab_link ptr;
+	printf("control symbol address length\n");
+	printf("section name\n");
+	printf("--------------------------------\n");
+	for (ptr = estab_head; ptr != NULL; ptr = ptr->link)
+	{
+		if (ptr->symbol_name[0] == '\0')//header record 이면
+		{
+			printf("%-7s %6s %6.4X %6.4X\n", ptr->csect_name, ptr->symbol_name, ptr->addr, ptr->cs_length);
+			prog_length = ptr->addr + ptr->cs_length - prog_addr;
+		}
+		else//define record이면
+		{
+			printf("%-7s %6s %6.4X\n", ptr->csect_name, ptr->symbol_name, ptr->addr);
+		}
+
+	}
+	printf("--------------------------------\n");
+	printf("           total length %.4X\n", prog_length);
+
+
+
+	reg[0] = 0; reg[1] = 0; reg[3] = 0; reg[4] = 0; reg[5] = 0; // REGISTER 0으로 초기화
+	reg[8] = prog_addr;//pc에 첫 수행주소 넣어줌.
+	reg[2] = prog_length;//L register에 프로그램 전체 길이 넣어줌.
+}
+/////////////////////////////////////////////
+//함수명: loader_pass1                       //
+//기능:  loader의 pass1을 수행하는 역할을 한다.   //
+//                                         //
+//리턴: 성공시 1리턴, 실패시 -1리턴              //
+/////////////////////////////////////////////
+int loader_pass1(char* file_name)
+{
+	FILE* fp = fopen(file_name, "r");
+	char record[200];
+	char prog_name[7] = { 0 };//이름 저장
+	char prog_length[7] = { 0 };//길이 저장
+	char start_addr[7] = { 0 };//시작 주소 저장
+	char symbol_name[7] = { 0 };//symbo이름 저장
+	char symbol_addr[7] = { 0 };//symbol address저장
+	
+	if (fp == NULL)
+	{
+		printf("cannot find file: %s\n", file_name);
+		return -1;
+	}
+	else {
+
+		do {
+			//파일에 끝에 도달한 경우 끝냄.
+			if (fgets(record, 200, fp) == NULL)
+			{
+				break;
+			}
+
+			if (record[0] == 'H')//header record인 경우
+			{
+				int i;
+				for (i = 1; i < 7; i++)//head record에서 program name 받아옴.
+				{
+					prog_name[i - 1] = record[i];
+					if (prog_name[i - 1] == ' ')//빈칸이면 \0로 바꾸어줌.
+					{
+						prog_name[i - 1] = '\0';//빈칸이면 
+						break;
+					}
+				}
+				prog_name[6] = '\0';
+
+				for (i = 7; i < 13; i++)//head record에서 start address 받아옴.
+				{
+					start_addr[i - 7] = record[i];
+				}
+				start_addr[6] = '\0';
+
+				for (i = 13; i < 19; i++)//head record에서 program length 받아옴.
+				{
+					prog_length[i - 13] = record[i];
+				}
+				prog_length[6] = '\0';
+
+				cs_length = string_to_int(prog_length);//cs_length에 length 저장.
+
+				Estab* estab_node = (Estab*)malloc(sizeof(Estab));
+
+				strcpy(estab_node->csect_name, prog_name);//값 할당
+				strcpy(estab_node->symbol_name, "");
+				estab_node->addr = string_to_int(start_addr) + cs_addr;
+				estab_node->cs_length = cs_length;
+				estab_node->link = NULL;
+
+				if (estab_add(estab_node) == -1)
+				{
+					printf("duplicate symbol name!\n");
+					return -1;
+				}
+			}
+			else if (record[0] == 'D')//define record인 경우
+			{
+				int name_index = 1;
+				int addr_index = 7;
+				int i;
+				while (1)
+				{
+					if (record[name_index] == '\n')//끝에 도달하면 break
+						break;
+					for (i = name_index; i < name_index + 6; i++)//symbol의 이름 받아옴.
+					{
+						symbol_name[i - name_index] = record[i];
+						if (symbol_name[i - name_index] == ' ')
+						{
+							symbol_name[i - name_index] = '\0';
+							break;
+						}
+					}
+					symbol_name[6] = '\0';
+
+					for (i = addr_index; i < addr_index + 6; i++)//symbol의 relative address 받아옴
+					{
+						symbol_addr[i - addr_index] = record[i];
+					}
+					symbol_addr[6] = '\0';
+
+					//estab에 추가.
+					Estab* estab_node = (Estab*)malloc(sizeof(Estab));
+
+					strcpy(estab_node->symbol_name, symbol_name);//값 할당
+					strcpy(estab_node->csect_name, "");
+					estab_node->addr = cs_addr + string_to_int(symbol_addr);
+					estab_node->link = NULL;
+
+					if (estab_add(estab_node) == -1)
+					{
+						printf("duplicate symbol name!\n");
+						return -1;
+					}
+
+					name_index += 12;
+					addr_index += 12;
+				}
+			}
+			else if (record[0] == 'E')
+			{
+				cs_addr += cs_length;
+			}
+		} while (1);
+	}
+	fclose(fp);
+	return 1;
+}
+/////////////////////////////////////////////
+//함수명: get_external_symbol_address        //
+//기능:  symbol이름을 받아서 estab에서 해당       //
+//      symbol을 찾아 address를 반환하는 역할    //
+//리턴: 성공시 1리턴, 실패시 -1리턴               //
+/////////////////////////////////////////////
+int get_external_symbol_address(char* symbol_name)
+{
+	estab_link ptr;
+	for (ptr = estab_head; ptr != NULL; ptr = ptr->link)
+	{
+		//심볼이름을 찾으면 서로 겹치면 addr리턴해줌
+		if (!strcmp(ptr->symbol_name, symbol_name) ||
+			!strcmp(ptr->csect_name, symbol_name))
+		{
+			return ptr->addr;
+		}
+	}
+	return -1;
+}
+/////////////////////////////////////////////
+//함수명: loader_pass2                      //
+//기능:  loader의 pass2을 수행하는 역할을 한다.   //
+//                                         //
+//리턴: 성공시 1리턴, 실패시 -1리턴              //
+/////////////////////////////////////////////
+int loader_pass2(char* file_name)
+{
+	FILE* fp = fopen(file_name, "r");
+	char prog_length[7] = { 0 };//길이 저장
+	char record[200];//record 한줄 의미
+	int ref_flag = 0;//reference number를 사용하는지의 여부 체크
+	int ref_table[30];
+	if (fp == NULL)
+	{
+		printf("cannot find file: %s\n", file_name);
+		return -1;
+	}
+	else {
+		do {
+			//파일에 끝에 도달한 경우 끝냄.
+			if (fgets(record, 200, fp) == NULL)
+			{
+				break;
+			}
+			if (strlen(record) != 0)//끝문자 \n을 널문자로 바꾸어줌.
+			{
+				record[strlen(record) - 1] = '\0';
+			}
+
+			if (record[0] == 'H')//header record인 경우
+			{
+				
+				strcpy(prog_length, record + 13);
+
+				cs_length = string_to_int(prog_length);//cs_length에 length 저장.
+			}
+			else if (record[0] == 'R')//reference record인 경우
+			{
+				if ('0' <= record[1] && record[1] <= '9')//referece number used.
+				{
+					ref_flag = 1;
+					//todo:reference number에 대한 처리.
+
+					ref_table[1] = cs_addr;//1번은 항상 control section의 address임.
+					int i;
+					int ref_number;
+					int symbol_address;
+					char symbol_name[7];
+					for (i = 1; i < strlen(record); i += 8)
+					{
+						sscanf(record + i, "%2X%6s", &ref_number, symbol_name);//reference number와 symbol을 받아옴
+						symbol_address = get_external_symbol_address(symbol_name);//symbol이름으로 symbol address를 estab에서 찾아옴
+						if (symbol_address == -1)
+						{
+							printf("can not find symbol in estab\n");
+							return -1;
+						}
+						ref_table[ref_number] = symbol_address;
+					}
+				}
+				else
+				{
+					ref_flag = 0;
+				}
+			}
+			else if (record[0] == 'T')//text record인 경우
+			{
+				char ctext_address[7] = { 0 };
+				char ctext_length[3] = { 0 };
+				char ctext_byte[3] = { 0 };
+				int text_address;
+				int text_length;
+				int text_byte;
+				strncpy(ctext_address, record + 1, 6);//record의 시작 주소와
+				strncpy(ctext_length, record + 7, 2);//record의 길이 받아옴
+				text_address = string_to_int(ctext_address);//int로 바꾸어 저장
+				text_length = string_to_int(ctext_length);//int로 바꾸어 저장
+
+				int i;
+				for (i = 0; i < text_length; i++)
+				{
+					strncpy(ctext_byte, record + 9 + i * 2, 2);//text record를 한바이트씩 받아옴.
+					text_byte = string_to_int(ctext_byte);
+					memory_space[cs_addr + text_address + i] = (unsigned char)text_byte;//메모리에 넣어줌.
+				}
+			}
+			else if (record[0] == 'M')//modifi record인 경우
+			{
+				int modi_address, start_address, modi_half_byte;//modification에 필요한 정보
+				char modi_sign;//+, -의 사인
+				if (ref_flag == 1)
+				{
+					//todo: reference number를 사용하는 경우
+					char cstart_address[7] = { 0 };//modification이 필요한 시작주소
+					char cmodi_half_byte[3] = { 0 };//half byte정보
+					int ref_number;
+					strncpy(cstart_address, record + 1, 6);//modification이 필요한 시작 주소와
+					start_address = string_to_int(cstart_address) + cs_addr;//integer로 저장
+					strncpy(cmodi_half_byte, record + 7, 2);//half byte 정보 받아옴
+					modi_half_byte = string_to_int(cmodi_half_byte);//integer로 저장
+					modi_sign = record[9];//+, -의 sign 가져옴
+					sscanf(record + 10, "%2X", &ref_number);
+					modi_address = ref_table[ref_number];
+				}
+				else
+				{
+					char cstart_address[7] = { 0 };//modification이 필요한 시작주소
+					char cmodi_half_byte[3] = { 0 };//half byte정보
+					char modi_symbol[7] = { 0 };//symbol
+					strncpy(cstart_address, record + 1, 6);//modification이 필요한 시작 주소와
+					start_address = string_to_int(cstart_address) + cs_addr;//integer로 저장
+					strncpy(cmodi_half_byte, record + 7, 2);//half byte 정보 받아옴
+					modi_half_byte = string_to_int(cmodi_half_byte);//integer로 저장
+					modi_sign = record[9];//+, -의 sign 가져옴
+					strcpy(modi_symbol, record + 10);//symbol 가져옴.
+					modi_address = get_external_symbol_address(modi_symbol);//symbol이름으로 symbol address를 estab에서 찾아옴
+					if (modi_address == -1)
+					{
+						printf("can not find symbol in estab\n");
+						return -1;
+					}
+				}
+				int i;
+				int value = 0;//start address부터 수정되야 하는 value값 가져와 나중에 수정된 값 저장.
+				if (modi_half_byte % 2 == 1)//odd이면 처음 byte는 뒤쪽 half바이트만 인정해야하므로
+				{
+					value = memory_space[start_address];
+					value &= 0xf;
+				}
+				else//짝수인 경우 처음 byte는 모든 byte를 인정.
+				{
+					value = memory_space[start_address];
+				}
+
+				for (i = start_address + 1; i <= start_address + (modi_half_byte - 1) / 2; i++) //modification이 필요한 나머지 byte들을 순회하여 value 만들어줌.
+				{
+					value = value *256;
+					value += memory_space[i];
+				}
+				if (modi_sign == '+')//plus인 경우 memory space에 더해줌
+				{
+					value += modi_address;
+				}
+				else if (modi_sign == '-')//마이너스인 경우 빼줌.
+				{
+					value -= modi_address;
+				}
+				else
+				{
+					printf("sign should be + or -.\n");
+					return -1;
+				}
+
+				for (i = start_address + (modi_half_byte - 1) / 2; i >= start_address + 1; i--) //메모리에 수정된 값들 update
+				{
+					memory_space[i] = value & 0xff;
+					value = value >> 8;
+				}
+				if (modi_half_byte % 2 == 1)//odd이면 처음 byte는 뒤쪽 half바이트만 update
+				{
+					memory_space[i] &= 0xf0;
+					memory_space[i] += value & 0xf;
+				}
+				else//짝수인 경우 처음 byte는 byte 전체를 update
+				{
+					memory_space[i] = value & 0xff;
+				}
+
+			}
+			else if (record[0] == 'E')
+			{
+				if (record[1] != ' ' && record[1] != '\0')//endrecord 뒤에 주소가 있다면 exec address 업데이트
+				{
+					char cexec_addr[7] = { 0 };
+					strcpy(cexec_addr, record + 1);
+					exec_addr = cs_addr+string_to_int(cexec_addr);
+				}
+
+			}
+		} while (1);
+
+		cs_addr += cs_length;
+		fclose(fp);
+	}
+	return 1;
+}
 
 ////////////////////////////////////////////////
 //함수명: init_opcode_table                   //
@@ -775,11 +1814,11 @@ void assemble()
 	strcpy(lst_filename, filename);
 	strcpy(obj_filename + strlen(obj_filename) - 3, "obj");
 	strcpy(lst_filename + strlen(obj_filename) - 3, "lst");
-	
+
 
 	//pass1을 실행
 	pass1_flag = pass1();
-	
+
 	//만약 pass1이 실패한다면 symbol table과 modify list와, object_code list, intermediate file을 삭제
 	if (pass1_flag == 0)
 	{
@@ -836,8 +1875,7 @@ void symbol()
 	if (real_symbol_head == NULL)//symbol table이 아직 생성되지 않음.
 	{
 		printf("Symbol Table not exists.\n");
-		return;
-	
+
 	}
 
 	for (ptr = real_symbol_head; ptr != NULL; ptr = ptr->link)
@@ -1055,7 +2093,7 @@ int add_symbol_to_symbol_list(char* label, int line_num, int location_counter)
 				//new_symbol이 ptr이전거보다 크고 ptr보다 작으면 그 사이에 new_symbol이 들어가야함.
 				if (strcmp(new_symbol->label, prev->label) > 0 && strcmp(new_symbol->label, ptr->label) < 0)
 				{
-					
+
 					prev->link = new_symbol;
 					new_symbol->link = ptr;
 					break;
@@ -1164,9 +2202,9 @@ int pass1()
 			//start로 시작하지 않은 경우.
 			if (start_flag == 0 && strcmp(opcode, "START"))
 			{
-				start_flag=1;
-				start_address=0;
-				location_counter=start_address;
+				start_flag = 1;
+				start_address = 0;
+				location_counter = start_address;
 			}
 
 			if (label[0] != '\0')//label이 있는 경우
@@ -1269,7 +2307,7 @@ int pass1()
 //기능: opcode table에서 mnemonic에 해당하는 opcode반환//
 //리턴: 성공시 opcode, 실패시 -1                       //
 /////////////////////////////////////////////////////////
-int find_opcode(char *mnemonic)
+int find_opcode(char* mnemonic)
 {
 	int hash_key = hash_function(mnemonic);//mnemonic을 통해 hash_key찾아냄
 	int flag = 0;//찾았으면 1, 없으면 0;
@@ -1387,7 +2425,7 @@ void print_record(FILE* obj_fp)
 	int i;
 	char record[61] = { '\0' };//record를 저장하는 배열 (object 코드 저장)
 	int record_index = 0;
-	int record_address=0;
+	int record_address = 0;
 	memset(record, '\0', sizeof(record));
 
 	for (ptr = object_code_head; ptr != NULL; ptr = ptr->link)//text record 출력
@@ -1409,7 +2447,7 @@ void print_record(FILE* obj_fp)
 			record[record_index] = '\0';
 
 			//record 한줄을 써주고
-			fprintf(obj_fp, "T%06X%02X%s\n", record_address,record_index/2, record);
+			fprintf(obj_fp, "T%06X%02X%s\n", record_address, record_index / 2, record);
 			memset(record, '\0', sizeof(record));//record배열 초기화
 			record_index = 0;//record index를 초기화 해줌.
 		}
@@ -1502,9 +2540,9 @@ int pass2()
 		//interline에서 원래 label이 들어가야하는 index를 계산
 		int tab_count = 0;//interline의 탭 개수를 셈
 		int label_index = 0;//label이 들어가야 할 인덱스 저장.
-		for (label_index = 0;label_index < strlen(inter_line); label_index++)
+		for (label_index = 0; label_index < strlen(inter_line); label_index++)
 		{
-			if (inter_line[label_index]=='\t')
+			if (inter_line[label_index] == '\t')
 			{
 				tab_count++;
 			}
@@ -1671,7 +2709,7 @@ int pass2()
 			if (format == 1)
 			{
 				//format1인데 operand가 있으면 안됨.
-				if (real_operand[0]!='\0')
+				if (real_operand[0] != '\0')
 				{
 					print_error(line_num, "format1 should not have a operand!");
 					fclose(lst_fp);
@@ -1679,7 +2717,7 @@ int pass2()
 					fclose(inter_fp);
 					return 0;
 				}
-				int opcode=find_opcode(real_mnemonic);
+				int opcode = find_opcode(real_mnemonic);
 				sprintf(object_code, "%02X", opcode);//16진수로 바꾸어줌
 				add_object_code(object_code, string_to_int(loc_count));
 				fprintf(lst_fp, "%-60s\t\t%s\n", inter_line, object_code);//lst code 만들어냄.
@@ -1701,7 +2739,7 @@ int pass2()
 						return 0;
 					}
 
-					sprintf(object_code, "%04X", opcode*16*16+first_reg_val*16+second_reg_val);
+					sprintf(object_code, "%04X", opcode * 16 * 16 + first_reg_val * 16 + second_reg_val);
 					add_object_code(object_code, string_to_int(loc_count));
 					fprintf(lst_fp, "%-60s\t\t%s\n", inter_line, object_code);//lst code 만들어냄.			
 
@@ -1740,7 +2778,7 @@ int pass2()
 
 					first8 = opcode + 2 * N + I;//opcode+ni
 					second4 = X * 8 + B * 4 + P * 2 + E * 1;//xbpe
-					third12=0;//address
+					third12 = 0;//address
 
 					//각각을 16진수로 바꾸어줌
 					sprintf(object1, "%02X", first8);
@@ -1754,7 +2792,7 @@ int pass2()
 					add_object_code(object_code, string_to_int(loc_count));
 					fprintf(lst_fp, "%-60s\t\t%s\n", inter_line, object_code);//lst code 만들어냄.
 				}
-				else if(N==1 && P==1)//SIMPLE ADDRESSSING인 경우
+				else if (N == 1 && P == 1)//SIMPLE ADDRESSSING인 경우
 				{
 					first8 = opcode + 2 * N + I;//opcode+ni
 
@@ -1801,7 +2839,7 @@ int pass2()
 					{
 						P = 0; B = 1;//PC RELATIVE에서 BASE RELATIVE로 바꿈.
 						third12 = ptr->location_counter - BASE;
-						if (third12 <0 ||third12>4095)//base relative도 될 수 없다면
+						if (third12 < 0 || third12>4095)//base relative도 될 수 없다면
 						{
 							print_error(line_num, "cannot be a format3");
 							fclose(lst_fp);
@@ -1950,10 +2988,10 @@ int pass2()
 				}
 				else//operand가 label이 아니라면 operand는 숫자임.
 				{
-					int num_flag=1;//operand가 숫자인지 check하는 flag;//1이면 숫자
+					int num_flag = 1;//operand가 숫자인지 check하는 flag;//1이면 숫자
 					for (i = 0; i < strlen(real_operand); i++)
 					{
-						if (operand[0]!='#' || real_operand[i] < '0' || real_operand[i]>'9')
+						if (operand[0] != '#' || real_operand[i] < '0' || real_operand[i]>'9')
 						{
 							num_flag = 0;
 							break;
@@ -1996,14 +3034,14 @@ int pass2()
 				if (real_operand[0] == 'C')
 				{
 					int char_length = (strlen(real_operand) - 3);//char의 길이
-					for (i = char_length+1; i >=2; i--)//진짜 char 돌면서
+					for (i = char_length + 1; i >= 2; i--)//진짜 char 돌면서
 					{
 						integer_object += real_operand[i] * hex;
 						hex *= 256;
 					}
 					sprintf(object_code, "%X", integer_object);
 				}
-				else if(real_operand[0] == 'X')
+				else if (real_operand[0] == 'X')
 				{
 					int char_length = (strlen(real_operand) - 3);//문자의 길이
 					if (char_length % 2 == 1)//홀수인 경우 앞에 0을 넣어줌
@@ -2037,9 +3075,9 @@ int pass2()
 				add_object_code(object_code, string_to_int(loc_count));
 				fprintf(lst_fp, "%-60s\t\t%s\n", inter_line, object_code);//lst code 만들어냄.
 			}
-			if (format==6)//word
+			if (format == 6)//word
 			{
-				int number=atoi(real_operand);
+				int number = atoi(real_operand);
 				number &= 0xffffff;//3byte
 				sprintf(object_code, "%06X", number);
 				add_object_code(object_code, string_to_int(loc_count));
